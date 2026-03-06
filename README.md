@@ -371,7 +371,7 @@ If you use this work, please cite:
 ```bibtex
 @software{ane_lora_training,
   title={ANE LoRA Training: Neural Engine Gradient Computation on Apple Silicon},
-  author={Jay Guthrie},
+  author={Straughter Guthrie},
   year={2026},
   url={https://github.com/jmanhype/ane-lora-training}
 }
