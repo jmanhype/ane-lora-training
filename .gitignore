@@ -11,3 +11,9 @@ build/
 .env
 *.npy
 /tmp/
+
+# Runtime data (training pairs, saved adapters)
+data/
+
+# Built bridge binary (users build from source)
+bridge/libane_bridge.dylib

@@ -100,14 +100,19 @@ ANE leaks ~1 compile handle per `ane_bridge_compile()` call. After ~119 compiles
 
 ```
 ane-lora-training/
-├── ane_lora_kernels.py           # Core: conv-based ANE dispatch + MLX VJP
+├── ane_lora_kernels.py              # Core: conv-based ANE dispatch + MLX VJP
+├── requirements.txt                 # Python dependencies
+├── bridge/
+│   ├── ane_bridge.h                 # ANE bridge C header
+│   ├── ane_bridge.m                 # ANE bridge Obj-C implementation
+│   └── Makefile                     # Build libane_bridge.dylib
+├── examples/
+│   └── mlx_lora_daemon.py           # Full daemon: MLX inference + ANE training
 ├── tests/
 │   ├── test_spatial_constraints.py  # ANE dimension constraint discovery
 │   ├── test_conv_matmul.py          # Direct conv-as-matmul verification
 │   ├── test_gradient_pipeline.py    # Full 4-step gradient pipeline
 │   └── test_subprocess_dispatch.py  # End-to-end subprocess dispatch
-├── examples/
-│   └── mlx_lora_daemon.py           # Full daemon: MLX inference + ANE training
 └── docs/
     └── findings.md                  # Detailed technical findings & dead ends
 ```
@@ -116,26 +121,40 @@ ane-lora-training/
 
 - **Hardware**: Apple Silicon Mac (M1/M2/M3/M4) — tested on M4 Mac Mini 16GB
 - **OS**: macOS 15+ (Sequoia)
-- **ANE Bridge**: `libane_bridge.dylib` from [maderix/ANE](https://github.com/maderix/ANE)
+- **Xcode Command Line Tools**: `xcode-select --install` (for building the bridge)
 - **Python**: 3.11+ (tested on 3.14)
-- **Dependencies**: `numpy` (core), `mlx`, `mlx-lm` (for MLX integration)
+- **Dependencies**: `pip install -r requirements.txt` (`mlx`, `mlx-lm`, `numpy`)
 
 ## Quick Start
 
-### 1. Build the ANE Bridge
+### 1. Clone and Set Up
 
 ```bash
-git clone https://github.com/maderix/ANE.git
-cd ANE/bridge
-clang -framework Foundation -framework IOKit -framework CoreML \
-  -dynamiclib -o libane_bridge.dylib ane_bridge.m
+git clone https://github.com/jmanhype/ane-lora-training.git
+cd ane-lora-training
+pip install -r requirements.txt
 ```
 
-### 2. Run the Tests
+### 2. Build the ANE Bridge
 
 ```bash
-# Set your bridge path
-export ANE_BRIDGE_PATH=/path/to/libane_bridge.dylib
+cd bridge && make && cd ..
+```
+
+This compiles `libane_bridge.dylib` which wraps Apple's private ANE APIs (`_ANEInMemoryModel`, `_ANERequest`, etc.) into C-callable functions. Requires macOS with Xcode CLI tools.
+
+
+
+
+
+
+
+### 3. Run the Tests
+
+```bash
+# Tests auto-detect bridge at ./bridge/libane_bridge.dylib
+# Or set explicitly:
+export ANE_BRIDGE_PATH=./bridge/libane_bridge.dylib
 
 # Test spatial constraints (understand ANE limits)
 python tests/test_spatial_constraints.py
@@ -150,7 +169,7 @@ python tests/test_gradient_pipeline.py
 python tests/test_subprocess_dispatch.py
 ```
 
-### 3. Use in Your MLX Training Loop
+### 4. Use in Your MLX Training Loop
 
 ```python
 from ane_lora_kernels import ANELoRAKernels
@@ -169,7 +188,7 @@ for d_lora_a, d_lora_b in results:
     # Apply gradients...
 ```
 
-### 4. Full MLX Integration
+### 5. Full MLX Integration
 
 ```python
 from ane_lora_kernels import ANELoRAKernels, set_ane_kernels, replace_lora_with_ane
@@ -187,6 +206,32 @@ print(f"Replaced {n} LoRA layers with ANE-backed versions")
 # Training now automatically dispatches LoRA gradients to ANE
 loss, grads = nn.value_and_grad(model, loss_fn)(model, ...)
 ```
+
+### 6. Run the Real-Time Fine-Tuning Daemon
+
+The daemon serves an MLX LLM on an HTTP API. Each chat response triggers a background LoRA training step with gradients computed on ANE:
+
+```bash
+# Start daemon (downloads model on first run, ~1.8GB)
+python examples/mlx_lora_daemon.py
+
+# Chat with it (non-streaming)
+curl -s -X POST http://localhost:8766/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"stream":false}'
+
+# Check ANE training stats
+curl -s http://localhost:8766/status | python3 -m json.tool
+```
+
+The daemon auto-saves LoRA adapters to `data/adapter/` and training pairs to `data/training/`. On restart, it loads the saved adapter and continues improving.
+
+Environment variables:
+- `ANE_MODEL` — HuggingFace model ID (default: `mlx-community/Qwen2.5-3B-Instruct-4bit`)
+- `ANE_PORT` — Server port (default: `8766`)
+- `ANE_LORA_RANK` — LoRA rank (default: `8`)
+- `ANE_LORA_LAYERS` — Number of layers to apply LoRA (default: `4`, last N)
+- `ANE_BRIDGE_PATH` — Path to `libane_bridge.dylib` (default: `./bridge/libane_bridge.dylib`)
 
 ## MIL (Model Intermediate Language) Reference
 
@@ -328,6 +373,6 @@ If you use this work, please cite:
   title={ANE LoRA Training: Neural Engine Gradient Computation on Apple Silicon},
   author={Ex0byt},
   year={2026},
-  url={https://github.com/maderix/ane-lora-training}
+  url={https://github.com/jmanhype/ane-lora-training}
 }
 ```
