@@ -362,7 +362,7 @@ See [docs/findings.md](docs/findings.md) for the complete technical narrative in
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
 
 ## Citation
 
@@ -371,7 +371,7 @@ If you use this work, please cite:
 ```bibtex
 @software{ane_lora_training,
   title={ANE LoRA Training: Neural Engine Gradient Computation on Apple Silicon},
-  author={Ex0byt},
+  author={Jay Guthrie},
   year={2026},
   url={https://github.com/jmanhype/ane-lora-training}
 }
