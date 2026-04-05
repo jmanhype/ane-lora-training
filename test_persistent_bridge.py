@@ -1,5 +1,6 @@
 """Tests for persistent ANE bridge implementation."""
 
+import os
 import multiprocessing as mp
 import numpy as np
 import pytest
@@ -308,6 +309,261 @@ class TestIntegrationScenarios:
         # This would test the batch processing capability
         # Placeholder for future integration test
         pass
+
+
+# ---------------------------------------------------------------------------
+# Integration Tests (require real ANE bridge)
+# ---------------------------------------------------------------------------
+
+def find_bridge_path():
+    """Find libane_bridge.dylib in standard locations."""
+    candidates = [
+        "./libane_bridge.dylib",
+        "./build/libane_bridge.dylib",
+        "../build/libane_bridge.dylib",
+        os.path.expanduser("~/Projects/ane-lora-training/build/libane_bridge.dylib"),
+        "/Users/speed/Projects/ane-lora-training/build/libane_bridge.dylib",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@pytest.mark.integration
+class TestRealPersistentBridge:
+    """Integration tests requiring actual ANE bridge."""
+
+    @pytest.fixture(autouse=True)
+    def check_bridge_available(self):
+        """Skip these tests if bridge is not available."""
+        self.bridge_path = find_bridge_path()
+        if self.bridge_path is None:
+            pytest.skip("libane_bridge.dylib not found")
+
+    @pytest.fixture
+    def bridge(self):
+        """Create a real bridge instance for testing."""
+        b = PersistentANEBridge(self.bridge_path)
+        yield b
+        b.shutdown()
+
+    def test_init_real_bridge(self, bridge):
+        """Test that real bridge initializes successfully."""
+        assert bridge._proc.is_alive()
+        assert bridge.total_compiles == 0
+        assert bridge.total_dispatches == 0
+        assert bridge.total_steps == 0
+
+    def test_shutdown_real_bridge(self, bridge):
+        """Test clean shutdown of real bridge."""
+        assert bridge._proc.is_alive()
+        bridge.shutdown()
+        assert not bridge._proc.is_alive()
+
+    def test_double_shutdown_safe(self, bridge):
+        """Test that double shutdown is safe."""
+        bridge.shutdown()
+        bridge.shutdown()  # Should not raise
+
+    def _numpy_lora_gradient(self, dy, x, lora_a, lora_b):
+        """Reference numpy implementation for validation."""
+        tmp = dy @ lora_b.T
+        d_lora_a = x.T @ tmp
+        ax = x @ lora_a
+        d_lora_b = ax.T @ dy
+        return d_lora_a, d_lora_b
+
+    @pytest.mark.parametrize("seq,out_dim,in_dim,rank", [
+        (16, 16, 16, 8),
+        (32, 32, 32, 16),
+        (64, 64, 64, 8),
+    ])
+    def test_gradient_correctness_vs_numpy(self, bridge, seq, out_dim, in_dim, rank):
+        """Test that ANE gradients match numpy reference."""
+        np.random.seed(42)
+
+        # Create test data
+        dy = np.random.randn(seq, out_dim).astype(np.float32) * 0.1
+        x = np.random.randn(seq, in_dim).astype(np.float32) * 0.1
+        lora_a = np.random.randn(in_dim, rank).astype(np.float32) * 0.01
+        lora_b = np.random.randn(rank, out_dim).astype(np.float32) * 0.01
+
+        # Compute with ANE
+        modules = [(dy, x, lora_a, lora_b)]
+        ane_results = bridge.compute_lora_gradients(modules)
+        d_a_ane, d_b_ane = ane_results[0]
+
+        # Compute with numpy
+        d_a_np, d_b_np = self._numpy_lora_gradient(dy, x, lora_a, lora_b)
+
+        # Compare (allow fp16 tolerance from ANE fp16 computation)
+        rtol = 1e-3
+        atol = 1e-5
+
+        np.testing.assert_allclose(d_a_ane, d_a_np, rtol=rtol, atol=atol,
+                                   err_msg="d_lora_a mismatch")
+        np.testing.assert_allclose(d_b_ane, d_b_np, rtol=rtol, atol=atol,
+                                   err_msg="d_lora_b mismatch")
+
+    def test_gradient_correctness_with_padding(self, bridge):
+        """Test gradients with sequences requiring padding (not multiple of 16)."""
+        np.random.seed(43)
+
+        # Sequence that requires padding (10 -> 16)
+        seq = 10
+        out_dim = 16
+        in_dim = 16
+        rank = 8
+
+        dy = np.random.randn(seq, out_dim).astype(np.float32) * 0.1
+        x = np.random.randn(seq, in_dim).astype(np.float32) * 0.1
+        lora_a = np.random.randn(in_dim, rank).astype(np.float32) * 0.01
+        lora_b = np.random.randn(rank, out_dim).astype(np.float32) * 0.01
+
+        modules = [(dy, x, lora_a, lora_b)]
+        ane_results = bridge.compute_lora_gradients(modules)
+        d_a_ane, d_b_ane = ane_results[0]
+
+        # Numpy reference
+        d_a_np, d_b_np = self._numpy_lora_gradient(dy, x, lora_a, lora_b)
+
+        # Should still match despite padding
+        np.testing.assert_allclose(d_a_ane, d_a_np, rtol=1e-3, atol=1e-5,
+                                   err_msg="d_lora_a mismatch with padding")
+        np.testing.assert_allclose(d_b_ane, d_b_np, rtol=1e-3, atol=1e-5,
+                                   err_msg="d_lora_b mismatch with padding")
+
+    def test_multiple_modules(self, bridge):
+        """Test gradient computation for multiple modules in one call."""
+        np.random.seed(44)
+
+        modules = []
+        for i in range(3):
+            seq = 16 + i * 8
+            out_dim = 16
+            in_dim = 16
+            rank = 8
+
+            dy = np.random.randn(seq, out_dim).astype(np.float32) * 0.1
+            x = np.random.randn(seq, in_dim).astype(np.float32) * 0.1
+            lora_a = np.random.randn(in_dim, rank).astype(np.float32) * 0.01
+            lora_b = np.random.randn(rank, out_dim).astype(np.float32) * 0.01
+
+            modules.append((dy, x, lora_a, lora_b))
+
+        # Compute with ANE
+        ane_results = bridge.compute_lora_gradients(modules)
+
+        # Verify each module
+        for i, (dy, x, lora_a, lora_b) in enumerate(modules):
+            d_a_ane, d_b_ane = ane_results[i]
+            d_a_np, d_b_np = self._numpy_lora_gradient(dy, x, lora_a, lora_b)
+
+            np.testing.assert_allclose(d_a_ane, d_a_np, rtol=1e-3, atol=1e-5,
+                                       err_msg=f"Module {i}: d_lora_a mismatch")
+            np.testing.assert_allclose(d_b_ane, d_b_np, rtol=1e-3, atol=1e-5,
+                                       err_msg=f"Module {i}: d_lora_b mismatch")
+
+    def test_sequential_steps(self, bridge):
+        """Test multiple sequential training steps."""
+        np.random.seed(45)
+
+        n_steps = 5
+        for step in range(n_steps):
+            dy = np.random.randn(16, 16).astype(np.float32) * 0.1
+            x = np.random.randn(16, 16).astype(np.float32) * 0.1
+            lora_a = np.random.randn(16, 8).astype(np.float32) * 0.01
+            lora_b = np.random.randn(8, 16).astype(np.float32) * 0.01
+
+            modules = [(dy, x, lora_a, lora_b)]
+            results = bridge.compute_lora_gradients(modules)
+
+            assert len(results) == 1
+            d_a, d_b = results[0]
+            assert d_a.shape == (16, 8)
+            assert d_b.shape == (8, 16)
+
+        # Verify stats
+        assert bridge.total_steps == n_steps
+        # Each step does 4 compiles (tmp, d_a, ax, d_b)
+        assert bridge.total_compiles == n_steps * 4
+        assert bridge.total_dispatches == n_steps * 4
+
+    def test_stats_tracking(self, bridge):
+        """Test that compile/dispatch/step stats are tracked correctly."""
+        np.random.seed(46)
+
+        # First step with 2 modules
+        modules = []
+        for _ in range(2):
+            dy = np.random.randn(16, 16).astype(np.float32) * 0.1
+            x = np.random.randn(16, 16).astype(np.float32) * 0.1
+            lora_a = np.random.randn(16, 8).astype(np.float32) * 0.01
+            lora_b = np.random.randn(8, 16).astype(np.float32) * 0.01
+            modules.append((dy, x, lora_a, lora_b))
+
+        bridge.compute_lora_gradients(modules)
+
+        assert bridge.total_steps == 1
+        assert bridge.total_compiles == 8  # 2 modules * 4 compiles
+        assert bridge.total_dispatches == 8
+
+
+@pytest.mark.integration
+class TestSharedMemory:
+    """Integration tests for SharedMemory functionality."""
+
+    def test_shared_memory_roundtrip(self):
+        """Test that shared memory transfers data correctly."""
+        # Create test array
+        original = np.random.randn(16, 32).astype(np.float32)
+
+        # Create shared memory
+        from multiprocessing import shared_memory
+        shm = shared_memory.SharedMemory(create=True, size=original.nbytes)
+
+        # Write
+        arr = np.ndarray(original.shape, dtype=np.float32, buffer=shm.buf)
+        np.copyto(arr, original)
+
+        # Read back
+        copy = arr.copy()
+
+        # Verify
+        np.testing.assert_array_equal(original, copy)
+
+        # Cleanup
+        shm.close()
+        shm.unlink()
+
+    def test_shared_memory_padding(self):
+        """Test shared memory with padded spatial dimensions."""
+        from multiprocessing import shared_memory
+
+        seq = 10
+        out_dim = 16
+        padded_seq = _pad_spatial(seq)  # Should be 16
+
+        # Create padded array
+        padded = np.zeros((padded_seq, out_dim), dtype=np.float32)
+        original = np.random.randn(seq, out_dim).astype(np.float32)
+        padded[:seq] = original
+
+        # Create shared memory
+        shm = shared_memory.SharedMemory(create=True, size=padded.nbytes)
+        arr = np.ndarray(padded.shape, dtype=np.float32, buffer=shm.buf)
+        np.copyto(arr, padded)
+
+        # Read back and trim
+        read_back = arr.copy()
+        trimmed = read_back[:seq]
+
+        # Verify trimmed matches original
+        np.testing.assert_array_equal(original, trimmed)
+
+        shm.close()
+        shm.unlink()
 
 
 if __name__ == "__main__":
