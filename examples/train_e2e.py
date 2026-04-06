@@ -21,6 +21,7 @@ import time
 # Ensure repo root is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import json
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
@@ -167,3 +168,65 @@ if ane_active:
     print(f"  ANE fallback:{stats.get('fallback_dispatches', 0)} dispatches")
 print(f"  Learning:    {'YES ✓' if losses[-1] < losses[0] else 'NO ✗'}")
 print()
+
+# ---------- Save loss curve ----------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+# Save raw data as JSON for reproducibility
+data_path = os.path.join(REPO_ROOT, "loss_data.json")
+with open(data_path, "w") as f:
+    json.dump({
+        "model": MODEL_NAME,
+        "lora_rank": LORA_RANK,
+        "lora_layers": LORA_LAYERS,
+        "lr": LR,
+        "steps": STEPS,
+        "ane_active": ane_active,
+        "losses": losses,
+        "step_times": step_times,
+        "avg_ms": float(np.mean(step_times) * 1000),
+    }, f, indent=2)
+print(f"  Saved loss data to {data_path}")
+
+# Plot loss curve
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss curve
+    ax1.plot(range(1, len(losses) + 1), losses, color="#2563eb", linewidth=2)
+    ax1.set_xlabel("Step", fontsize=12)
+    ax1.set_ylabel("Loss", fontsize=12)
+    ax1.set_title(f"ANE LoRA Training — Loss Curve\n{MODEL_NAME}", fontsize=13)
+    ax1.grid(True, alpha=0.3)
+    ax1.annotate(f"{losses[0]:.2f}", (1, losses[0]), fontsize=10,
+                 xytext=(10, 10), textcoords="offset points")
+    ax1.annotate(f"{losses[-1]:.2f}", (len(losses), losses[-1]), fontsize=10,
+                 xytext=(-40, 10), textcoords="offset points")
+
+    # Step time
+    ax2.plot(range(1, len(step_times) + 1),
+             [t * 1000 for t in step_times], color="#16a34a", linewidth=1.5, alpha=0.7)
+    ax2.axhline(y=float(np.mean(step_times) * 1000), color="#dc2626",
+                linestyle="--", linewidth=1.5, label=f"avg={np.mean(step_times)*1000:.0f}ms")
+    ax2.set_xlabel("Step", fontsize=12)
+    ax2.set_ylabel("Time (ms)", fontsize=12)
+    ax2.set_title("Step Time", fontsize=13)
+    ax2.legend(fontsize=11)
+    ax2.grid(True, alpha=0.3)
+
+    engine_label = "ANE fused kernel" if ane_active else "MLX GPU"
+    fig.suptitle(f"LoRA rank={LORA_RANK}, layers={LORA_LAYERS}, LR={LR} — [{engine_label}]",
+                 fontsize=11, y=0.02, color="gray")
+    plt.tight_layout()
+
+    plot_path = os.path.join(REPO_ROOT, "loss_curve.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved plot to {plot_path}")
+except ImportError:
+    print("  (matplotlib not installed — skipping plot)")
