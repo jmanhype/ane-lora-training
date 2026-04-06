@@ -224,10 +224,31 @@ bool ane_bridge_eval(ANEKernelHandle *kernel) {
     @autoreleasepool {
         if (!kernel || !kernel->model) return false;
         NSError *e = nil;
+
+        // macOS 15+: Must map IOSurfaces before evaluation
+        BOOL mapped = ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
+            kernel->model, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
+            kernel->request, NO, &e);
+        if (!mapped) {
+            fprintf(stderr, "ane_bridge: mapIOSurfaces failed: %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+            // Continue anyway — may not be required on older macOS
+            e = nil;
+        }
+
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
             kernel->model, @selector(evaluateWithQoS:options:request:error:),
             21, @{}, kernel->request, &e);
-        if (!ok) fprintf(stderr, "ane_bridge: eval failed: %s\n", e ? [[e description] UTF8String] : "unknown");
+        if (!ok) {
+            // Extract detailed error information for debugging
+            NSString *errorDomain = e ? [e domain] : @"unknown";
+            NSInteger errorCode = e ? [e code] : 0;
+            NSString *errorDesc = e ? [e localizedDescription] : @"no description";
+            fprintf(stderr, "ane_bridge: eval failed - Domain: %s, Code: %ld, Desc: %s, Full: %s\n",
+                    [errorDomain UTF8String], (long)errorCode,
+                    [errorDesc UTF8String],
+                    e ? [[e description] UTF8String] : "unknown");
+        }
         return ok;
     }
 }
