@@ -54,7 +54,7 @@ LoRA gradient computation — all 4 matrix multiplications per adapter module �
 └─────────────────────────────────────────────────────────────┘
                                                          │
                               ┌───────────────────────────▼──┐
-                              │     ANE Fused Kernel (~2.8W) │
+                              │   ANE Fused Kernel (~40 mW)  │
                               │                              │
                               │  Single IOSurface packing:   │
                               │    dy^T + x^T + B^T + A      │
@@ -125,6 +125,9 @@ The spatial (last) dimension must be **≥ 16 AND a multiple of 16**. Both input
 | Time per step | ~155 ms (persistent bridge) |
 | Fused kernel compile time | ~100 ms (once) |
 | Numerical error vs numpy | < 0.001 |
+| ANE power during training | ~37-47 mW (measured via powermetrics) |
+| GPU power during training | ~11-14 W |
+| Total system (training) | ~13-15 W |
 
 ## Quick Start
 

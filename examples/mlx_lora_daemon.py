@@ -4,7 +4,7 @@ ANE Real-Time Fine-Tuning Daemon
 Based on Ex0byt's pipeline architecture:
   1. MLX inference with live LoRA adapter (GPU/unified memory)
   2. SSE streaming responses back to client
-  3. Background ANE training on user+assistant pairs (Neural Engine @ 2.8W)
+  3. Background ANE training on user+assistant pairs (Neural Engine @ ~40 mW)
   4. LoRA adapter hot-swapped in-memory for next inference
 
 Port 8766 — daemon accepts POST /chat with JSON {messages: [...]}
