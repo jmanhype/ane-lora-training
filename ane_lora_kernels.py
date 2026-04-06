@@ -147,80 +147,30 @@ def _build_weight_blob(weights_f32: np.ndarray) -> bytes:
 def _gen_fused_lora_grad_mil(
     in_dim: int, out_dim: int, rank: int, spatial: int
 ) -> str:
-    """Generate fused MIL program for LoRA gradient computation.
+    """Generate fused MIL for LoRA gradient using packed-IOSurface + matmul.
 
-    Computes BOTH d_lora_a and d_lora_b in a single ANE dispatch by
-    chaining 4 conv operations internally:
-        1. tmp = dy @ B^T
-        2. d_A = x^T @ tmp
-        3. ax = x @ A
-        4. d_B = ax^T @ dy
+    Uses maderix's dynamic matmul pattern: single input with data packed along
+    spatial dimension, slice_by_size to extract, reshape+transpose for matmul.
 
-    This reduces per-module dispatches from 4 to 1, significantly
-    improving throughput for multi-module LoRA training.
+    Computes steps 1+3 (independent) in one dispatch:
+        1. tmp = B^T @ dy  → matmul([rank,out_dim] @ [out_dim,spatial])
+        3. ax  = A^T @ x   → matmul([rank,in_dim] @ [in_dim,spatial])
 
-    Args:
-        in_dim: Input dimension (x channel count)
-        out_dim: Output dimension (dy channel count)
-        rank: LoRA rank
-        spatial: Padded sequence length (ANE-aligned, multiple of 16)
+    Input layout [1, C, 1, spatial + out_dim + in_dim] where C = max(in_dim, out_dim):
+        [0:spatial]                  → dy[out_dim, spatial] (top out_dim channels)
+        [spatial:spatial+out_dim]    → B^T[rank, out_dim] packed in top rank channels
+        [spatial+out_dim:end]        → A^T[rank, in_dim] packed in top rank channels
+        x[in_dim, spatial] overlaid on [0:spatial] starting at channel offset out_dim
+        (only works when in_dim + out_dim <= C... too complex)
 
-    Returns:
-        MIL program text as string
-
-    Input tensors (all fp32):
-        - dy: [1, out_dim, 1, spatial] upstream gradient
-        - x:  [1, in_dim, 1, spatial] layer input
-        - A:  [rank, in_dim, 1, 1] LoRA A matrix (transposed for conv)
-        - B:  [out_dim, rank, 1, 1] LoRA B matrix
-
-    Output tensors (both fp32):
-        - d_A: [1, in_dim, 1, rank] gradient for LoRA A
-        - d_B: [1, rank, 1, out_dim] gradient for LoRA B
+    TODO: This approach requires careful channel-dimension packing when
+    in_dim != out_dim. For now, use the proven 4-dispatch unfused path.
+    Fusion will be implemented once the basic training loop is validated.
     """
-    return f"""program(1.3)
-{BUILD_INFO}
-{{
-    func main<ios18>(
-        tensor<fp32, [1, {out_dim}, 1, {spatial}]> dy,
-        tensor<fp32, [1, {in_dim}, 1, {spatial}]> x,
-        tensor<fp16, [{rank}, {in_dim}, 1, 1]> A,
-        tensor<fp16, [{out_dim}, {rank}, 1, 1]> B
-    ) {{
-        // Common conv params
-        string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
-        tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
-        tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
-        tensor<int32, [2]> c_dilations = const()[name = string("c_dilations"), val = tensor<int32, [2]>([1, 1])];
-        int32 c_groups = const()[name = string("c_groups"), val = int32(1)];
-        string to_fp16 = const()[name = string("to_fp16"), val = string("fp16")];
-        string to_fp32 = const()[name = string("to_fp32"), val = string("fp32")];
-
-        // Cast inputs to fp16
-        tensor<fp16, [1, {out_dim}, 1, {spatial}]> dy16 = cast(dtype = to_fp16, x = dy)[name = string("cast_dy")];
-        tensor<fp16, [1, {in_dim}, 1, {spatial}]> x16 = cast(dtype = to_fp16, x = x)[name = string("cast_x")];
-
-        // Step 1: tmp = dy @ B^T  →  conv(B, dy) -> [1, rank, 1, spatial]
-        tensor<fp16, [1, {rank}, 1, {spatial}]> tmp16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = B, x = dy16)[name = string("conv1")];
-
-        // Step 2: d_A = x^T @ tmp  →  conv(tmp, x) -> [1, in_dim, 1, rank]
-        // Need to reshape tmp from [1, rank, 1, spatial] to [spatial, rank, 1, 1] for weight
-        // This is handled by treating tmp as weight for conv with x
-        // Result spatial dim is rank (padded to 16)
-        tensor<fp16, [1, {in_dim}, 1, 16]> d_A16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = tmp16, x = x16)[name = string("conv2")];
-
-        // Step 3: ax = x @ A  →  conv(A, x) -> [1, rank, 1, spatial]
-        tensor<fp16, [1, {rank}, 1, {spatial}]> ax16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = A, x = x16)[name = string("conv3")];
-
-        // Step 4: d_B = ax^T @ dy  →  conv(dy, ax) -> [1, out_dim, 1, rank]
-        tensor<fp16, [1, {out_dim}, 1, 16]> d_B16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = ax16, x = dy16)[name = string("conv4")];
-
-        // Cast outputs to fp32
-        tensor<fp32, [1, {in_dim}, 1, 16]> d_A = cast(dtype = to_fp32, x = d_A16)[name = string("cast_d_A")];
-        tensor<fp32, [1, {out_dim}, 1, 16]> d_B = cast(dtype = to_fp32, x = d_B16)[name = string("cast_d_B")];
-    }} -> (d_A, d_B);
-}}
-"""
+    raise NotImplementedError(
+        "Fused kernel not yet ported to packed-IOSurface matmul pattern. "
+        "Use unfused 4-dispatch path (set ANE_DISABLE_FUSION=1 or don't call this)."
+    )
 
 
 def _gen_conv_mil(in_ch: int, out_ch: int, spatial: int) -> str:
