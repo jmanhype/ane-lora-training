@@ -233,33 +233,34 @@ bool ane_bridge_eval(ANEKernelHandle *kernel) {
 
         BOOL ok = NO;
 
-        if (client) {
-            // macOS 15+: Map IOSurfaces directly on model first
+        // Map IOSurfaces on model (may be required on macOS 15+)
+        ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
+            kernel->model, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
+            kernel->request, NO, &e);
+        e = nil;
+
+        // Direct model eval (only path that works with _ANEInMemoryModel)
+        ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+            kernel->model, @selector(evaluateWithQoS:options:request:error:),
+            21, @{}, kernel->request, &e);
+        if (!ok) {
+            fprintf(stderr, "ane_bridge: eval failed: %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+
+            // Unmap and remap, then retry
+            ((void(*)(id,SEL,id))objc_msgSend)(
+                kernel->model, @selector(unmapIOSurfacesWithRequest:), kernel->request);
+            e = nil;
             ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
                 kernel->model, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
-                kernel->request, NO, &e);
+                kernel->request, YES, &e);
             e = nil;
 
-            // Evaluate via client (5-arg: model, options, request, qos, error)
-            ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
-                client, @selector(evaluateWithModel:options:request:qos:error:),
-                kernel->model, @{}, kernel->request, 21, &e);
-        }
-
-        if (!ok && client) {
-            fprintf(stderr, "ane_bridge: client eval failed: %s\n",
-                    e ? [[e description] UTF8String] : "unknown");
-            // Fall back to direct model eval
-            e = nil;
-        }
-
-        if (!ok) {
-            // Legacy path: evaluate directly on model
             ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
                 kernel->model, @selector(evaluateWithQoS:options:request:error:),
                 21, @{}, kernel->request, &e);
             if (!ok) {
-                fprintf(stderr, "ane_bridge: direct eval failed: %s\n",
+                fprintf(stderr, "ane_bridge: eval retry failed: %s\n",
                         e ? [[e description] UTF8String] : "unknown");
             }
         }
