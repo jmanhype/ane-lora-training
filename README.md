@@ -10,16 +10,17 @@ LoRA gradient computation — all 4 matrix multiplications per adapter module �
   LoRA:   rank=8, layers=2
   ANE:    ACTIVE (fused kernel)
 
-  step   1/20  loss=4.0742  time=254ms  tokens=11  [ANE×8]
-  step   2/20  loss=4.0742  time=159ms  tokens=11  [ANE×8]
+  step   1/200  loss=4.0742  time=254ms   tokens=11  [ANE×8]
+  step   2/200  loss=4.0742  time=159ms   tokens=11  [ANE×8]
   ...
-  step  10/20  loss=4.0625  time=149ms  tokens=11  [ANE×8]
-  ...
-  step  20/20  loss=2.8457  time=161ms  tokens=18  [ANE×8]
+  step  50/200  loss=4.0117  time=149ms   tokens=11  [ANE×8]
+  step 100/200  loss=3.9492  time=155ms   tokens=11  [ANE×8]
+  step 150/200  loss=2.7441  time=155ms   tokens=18  [ANE×8]
+  step 200/200  loss=2.6426  time=155ms   tokens=18  [ANE×8]
 
-  Loss:        4.0742 → 2.8457 (Δ=-1.2285)
-  Avg time:    163 ms/step
-  ANE total:   160 dispatches
+  Loss:        4.0742 → 2.6426 (Δ=-1.4316)
+  Avg time:    155 ms/step
+  ANE total:   1,600 dispatches
   ANE fallback:0 dispatches
   Learning:    YES ✓
 ```
@@ -114,11 +115,12 @@ The spatial (last) dimension must be **≥ 16 AND a multiple of 16**. Both input
 
 | Metric | Value |
 |--------|-------|
-| Training steps | 20 |
-| Loss (start → end) | 4.07 → 2.85 |
+| Training steps | 200 |
+| Loss (start → end) | 4.07 → 2.64 (Δ=-1.43) |
 | ANE dispatches per step | 8 (fused, 1 per module) |
+| ANE dispatches total | 1,600 (0 fallbacks) |
 | GPU fallbacks | 0 |
-| Time per step | ~155 ms (steady state) |
+| Time per step | ~155 ms (persistent bridge) |
 | Fused kernel compile time | ~100 ms (once) |
 | Numerical error vs numpy | < 0.001 |
 

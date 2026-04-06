@@ -1054,13 +1054,15 @@ class PersistentANEBridge:
         self._total_dispatches = 0
         self._total_steps = 0
 
-        # Create communication channels
-        self._cmd_queue = mp.Queue()
-        self._result_queue = mp.Queue()
-        self._ready_event = mp.Event()
+        # Use 'spawn' start method to avoid forking with MLX GPU context
+        # (fork + MLX = deadlock on macOS)
+        ctx = mp.get_context('spawn')
+        self._cmd_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
+        self._ready_event = ctx.Event()
 
-        # Spawn worker process
-        self._proc = mp.Process(
+        # Spawn worker process (clean process, no inherited GPU state)
+        self._proc = ctx.Process(
             target=_persistent_ane_worker,
             args=(bridge_path, self._cmd_queue, self._result_queue, self._ready_event),
             daemon=True
