@@ -863,7 +863,122 @@ def _ane_gradient_worker(bridge_path: str, data_dir: str, result_dir: str):
 
 
 # --------------------------------------------------------------------------- #
-#  Persistent ANE bridge worker                                                 #
+#  Thread-based ANE bridge worker (avoids fork/spawn issues with MLX)           #
+# --------------------------------------------------------------------------- #
+
+def _persistent_ane_worker_thread(
+    bridge_path: str,
+    cmd_queue,      # threading queue
+    result_queue,   # threading queue
+    ready_event     # threading Event
+):
+    """Thread-based persistent ANE worker. Uses direct numpy arrays (no shared memory needed).
+
+    Commands (via cmd_queue):
+        {"cmd": "compute", "dy": np.array, "x": np.array, "a": np.array, "b": np.array,
+         "shapes": (seq, out_dim, in_dim, rank)}
+        {"cmd": "shutdown"}
+    """
+    import ctypes as ct
+
+    lib = ct.CDLL(bridge_path)
+    lib.ane_bridge_init.restype = ct.c_int
+    lib.ane_bridge_compile.restype = ct.c_void_p
+    lib.ane_bridge_compile.argtypes = [
+        ct.c_char_p, ct.c_size_t,
+        ct.POINTER(ct.c_uint8), ct.c_size_t,
+        ct.c_int, ct.POINTER(ct.c_size_t),
+        ct.c_int, ct.POINTER(ct.c_size_t),
+    ]
+    lib.ane_bridge_eval.restype = ct.c_bool
+    lib.ane_bridge_eval.argtypes = [ct.c_void_p]
+    lib.ane_bridge_write_input.argtypes = [
+        ct.c_void_p, ct.c_int, ct.c_void_p, ct.c_size_t]
+    lib.ane_bridge_read_output.argtypes = [
+        ct.c_void_p, ct.c_int, ct.c_void_p, ct.c_size_t]
+    lib.ane_bridge_free.argtypes = [ct.c_void_p]
+
+    rc = lib.ane_bridge_init()
+    if rc != 0:
+        ready_event.set()
+        result_queue.put({"status": "error", "msg": f"Bridge init failed: {rc}"})
+        return
+
+    ready_event.set()
+    dispatches = 0
+    kernel_cache = {}
+    use_fusion = os.environ.get('ANE_DISABLE_FUSION', '0') != '1'
+
+    try:
+        while True:
+            try:
+                msg = cmd_queue.get(timeout=1)
+            except:
+                continue
+
+            if msg.get("cmd") == "shutdown":
+                for kernel in kernel_cache.values():
+                    lib.ane_bridge_free(kernel)
+                kernel_cache.clear()
+                result_queue.put({"status": "shutdown_ack"})
+                break
+
+            if msg.get("cmd") != "compute":
+                continue
+
+            try:
+                dy = msg["dy"]
+                x = msg["x"]
+                lora_a = msg["a"]
+                lora_b = msg["b"]
+                seq, out_dim, in_dim, rank = msg["shapes"]
+
+                if use_fusion:
+                    d_a, d_b = _fused_dynamic_lora_grad(
+                        lib, dy, x, lora_a, lora_b, kernel_cache
+                    )
+                    dispatches += 1
+                else:
+                    padded_seq = _pad_spatial(seq)
+                    if padded_seq > seq:
+                        dy_p = np.zeros((padded_seq, out_dim), dtype=np.float32)
+                        dy_p[:seq] = dy
+                        x_p = np.zeros((padded_seq, in_dim), dtype=np.float32)
+                        x_p[:seq] = x
+                    else:
+                        dy_p, x_p = dy, x
+
+                    tmp = _dynamic_matmul(lib, lora_b, dy_p.T, kernel_cache).T[:seq]
+                    d_a_raw = _dynamic_matmul(lib, x_p.T,
+                        np.pad(tmp, ((0, padded_seq - seq), (0, 0))),
+                        kernel_cache)
+                    ax = _dynamic_matmul(lib, lora_a.T, x_p.T, kernel_cache).T[:seq]
+                    d_b_raw = _dynamic_matmul(lib,
+                        np.pad(ax, ((0, padded_seq - seq), (0, 0))).T,
+                        dy_p, kernel_cache)
+                    dispatches += 4
+                    d_a = d_a_raw[:in_dim, :rank]
+                    d_b = d_b_raw[:rank, :out_dim]
+
+                result_queue.put({
+                    "status": "ok",
+                    "d_a": d_a,
+                    "d_b": d_b,
+                    "dispatches": dispatches
+                })
+
+            except Exception as e:
+                result_queue.put({"status": "error", "msg": str(e)})
+
+    except Exception:
+        pass
+    finally:
+        for kernel in kernel_cache.values():
+            lib.ane_bridge_free(kernel)
+
+
+# --------------------------------------------------------------------------- #
+#  Persistent ANE bridge worker (multiprocessing — legacy)                      #
 # --------------------------------------------------------------------------- #
 
 def _persistent_ane_worker(
@@ -1054,16 +1169,18 @@ class PersistentANEBridge:
         self._total_dispatches = 0
         self._total_steps = 0
 
-        # Use 'spawn' start method to avoid forking with MLX GPU context
-        # (fork + MLX = deadlock on macOS)
-        ctx = mp.get_context('spawn')
-        self._cmd_queue = ctx.Queue()
-        self._result_queue = ctx.Queue()
-        self._ready_event = ctx.Event()
+        # Use threading instead of multiprocessing to avoid:
+        # - fork: deadlocks with MLX GPU context on macOS
+        # - spawn: requires __main__ guard, re-imports entire script
+        # Threading works because ANE dispatch is via ctypes (releases GIL)
+        import threading
+        import queue as thread_queue
+        self._cmd_queue = thread_queue.Queue()
+        self._result_queue = thread_queue.Queue()
+        self._ready_event = threading.Event()
 
-        # Spawn worker process (clean process, no inherited GPU state)
-        self._proc = ctx.Process(
-            target=_persistent_ane_worker,
+        self._proc = threading.Thread(
+            target=_persistent_ane_worker_thread,
             args=(bridge_path, self._cmd_queue, self._result_queue, self._ready_event),
             daemon=True
         )
@@ -1093,76 +1210,24 @@ class PersistentANEBridge:
             in_dim = x.shape[1]
             rank = lora_a.shape[1]
 
-            # Pad sequence to ANE spatial alignment
-            padded_seq = _pad_spatial(seq)
-
-            # Create shared memory for inputs
-            dy_pad = np.zeros((padded_seq, out_dim), dtype=np.float32)
-            dy_pad[:seq] = dy
-            x_pad = np.zeros((padded_seq, in_dim), dtype=np.float32)
-            x_pad[:seq] = x
-
-            dy_shm = shared_memory.SharedMemory(create=True, size=dy_pad.nbytes)
-            x_shm = shared_memory.SharedMemory(create=True, size=x_pad.nbytes)
-            a_shm = shared_memory.SharedMemory(create=True, size=lora_a.nbytes)
-            b_shm = shared_memory.SharedMemory(create=True, size=lora_b.nbytes)
-
-            dy_arr = np.ndarray(dy_pad.shape, dtype=np.float32, buffer=dy_shm.buf)
-            x_arr = np.ndarray(x_pad.shape, dtype=np.float32, buffer=x_shm.buf)
-            a_arr = np.ndarray(lora_a.shape, dtype=np.float32, buffer=a_shm.buf)
-            b_arr = np.ndarray(lora_b.shape, dtype=np.float32, buffer=b_shm.buf)
-
-            np.copyto(dy_arr, dy_pad)
-            np.copyto(x_arr, x_pad)
-            np.copyto(a_arr, lora_a)
-            np.copyto(b_arr, lora_b)
-
-            # Send compute command
+            # Send arrays directly (thread shares memory, no IPC needed)
             self._cmd_queue.put({
                 "cmd": "compute",
-                "dy_shm": dy_shm.name,
-                "x_shm": x_shm.name,
-                "a_shm": a_shm.name,
-                "b_shm": b_shm.name,
+                "dy": np.ascontiguousarray(dy, dtype=np.float32),
+                "x": np.ascontiguousarray(x, dtype=np.float32),
+                "a": np.ascontiguousarray(lora_a, dtype=np.float32),
+                "b": np.ascontiguousarray(lora_b, dtype=np.float32),
                 "shapes": (seq, out_dim, in_dim, rank),
-                "padded_seq": padded_seq
             })
 
             # Wait for result
             result = self._result_queue.get(timeout=30)
 
-            # Clean up input shared memory
-            dy_shm.close()
-            dy_shm.unlink()
-            x_shm.close()
-            x_shm.unlink()
-            a_shm.close()
-            a_shm.unlink()
-            b_shm.close()
-            b_shm.unlink()
-
             if result.get("status") == "error":
                 raise RuntimeError(f"Persistent ANE worker error: {result.get('msg')}")
 
-            # Read output from shared memory
-            d_a_shm = shared_memory.SharedMemory(name=result["d_a_shm"])
-            d_b_shm = shared_memory.SharedMemory(name=result["d_b_shm"])
-
-            d_a = np.ndarray(result["d_a_shape"], dtype=np.float32, buffer=d_a_shm.buf)
-            d_b = np.ndarray(result["d_b_shape"], dtype=np.float32, buffer=d_b_shm.buf)
-
-            d_a_copy = d_a.copy()
-            d_b_copy = d_b.copy()
-
-            d_a_shm.close()
-            d_a_shm.unlink()
-            d_b_shm.close()
-            d_b_shm.unlink()
-
-            self._total_compiles += result.get("compiles", 0)
-            self._total_dispatches += result.get("dispatches", 0)
-
-            results.append((d_a_copy, d_b_copy))
+            self._total_dispatches = result.get("dispatches", 0)
+            results.append((result["d_a"], result["d_b"]))
 
         self._total_steps += 1
         return results
@@ -1180,7 +1245,7 @@ class PersistentANEBridge:
         return self._total_steps
 
     def shutdown(self):
-        """Shutdown the persistent worker process."""
+        """Shutdown the persistent worker thread."""
         if self._proc.is_alive():
             self._cmd_queue.put({"cmd": "shutdown"})
             try:
@@ -1188,8 +1253,6 @@ class PersistentANEBridge:
             except:
                 pass
             self._proc.join(timeout=5)
-            if self._proc.is_alive():
-                self._proc.terminate()
 
     def __del__(self):
         self.shutdown()
