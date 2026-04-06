@@ -142,6 +142,202 @@ def _build_weight_blob(weights_f32: np.ndarray) -> bytes:
 #  MIL generation                                                               #
 # --------------------------------------------------------------------------- #
 
+def _gen_fused_lora_grad_mil(
+    in_dim: int, out_dim: int, rank: int, spatial: int
+) -> str:
+    """Generate fused MIL for all 4 LoRA gradient matmuls in one ANE dispatch.
+
+    Single-IOSurface: dy^T, x^T, B^T, A packed along spatial dimension.
+    Intermediates (tmp, axT) chain directly between matmuls inside MIL.
+
+    Input: [1, max_dim, 1, 2*ps + 2*pr]
+        sp[0:ps]          = dy^T[out_dim, ps]
+        sp[ps:2*ps]       = x^T[in_dim, ps]
+        sp[2*ps:2*ps+pr]  = B^T[out_dim, pr]
+        sp[2*ps+pr:end]   = A[in_dim, pr]
+
+    Outputs:
+        d_A: [1, in_dim, 1, pr]
+        d_B: [1, pr, 1, out_dim]
+    """
+    pr = _pad_spatial(rank)
+    max_dim = max(in_dim, out_dim)
+    ps = spatial
+    S_total = 2 * ps + 2 * pr
+
+    return f"""program(1.3)
+{BUILD_INFO}
+{{
+    func main<{MIL_TARGET}>(tensor<fp32, [1, {max_dim}, 1, {S_total}]> xin) {{
+        string to16 = const()[name = string("to16"), val = string("fp16")];
+        tensor<fp16, [1, {max_dim}, 1, {S_total}]> xh = cast(dtype = to16, x = xin)[name = string("cast_in")];
+
+        tensor<int32, [4]> b_dyT = const()[name = string("b_dyT"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [4]> s_dyT = const()[name = string("s_dyT"), val = tensor<int32, [4]>([1, {out_dim}, 1, {ps}])];
+        tensor<fp16, [1, {out_dim}, 1, {ps}]> dyT_raw = slice_by_size(x = xh, begin = b_dyT, size = s_dyT)[name = string("dyT_raw")];
+
+        tensor<int32, [4]> b_xT = const()[name = string("b_xT"), val = tensor<int32, [4]>([0, 0, 0, {ps}])];
+        tensor<int32, [4]> s_xT = const()[name = string("s_xT"), val = tensor<int32, [4]>([1, {in_dim}, 1, {ps}])];
+        tensor<fp16, [1, {in_dim}, 1, {ps}]> xT_raw = slice_by_size(x = xh, begin = b_xT, size = s_xT)[name = string("xT_raw")];
+
+        tensor<int32, [4]> b_BT = const()[name = string("b_BT"), val = tensor<int32, [4]>([0, 0, 0, {2 * ps}])];
+        tensor<int32, [4]> s_BT = const()[name = string("s_BT"), val = tensor<int32, [4]>([1, {out_dim}, 1, {pr}])];
+        tensor<fp16, [1, {out_dim}, 1, {pr}]> BT_raw = slice_by_size(x = xh, begin = b_BT, size = s_BT)[name = string("BT_raw")];
+
+        tensor<int32, [4]> b_A = const()[name = string("b_A"), val = tensor<int32, [4]>([0, 0, 0, {2 * ps + pr}])];
+        tensor<int32, [4]> s_A = const()[name = string("s_A"), val = tensor<int32, [4]>([1, {in_dim}, 1, {pr}])];
+        tensor<fp16, [1, {in_dim}, 1, {pr}]> A_raw = slice_by_size(x = xh, begin = b_A, size = s_A)[name = string("A_raw")];
+
+        tensor<int32, [4]> pm = const()[name = string("pm"), val = tensor<int32, [4]>([0, 1, 3, 2])];
+
+        tensor<int32, [4]> r_dyT = const()[name = string("r_dyT"), val = tensor<int32, [4]>([1, 1, {out_dim}, {ps}])];
+        tensor<fp16, [1, 1, {out_dim}, {ps}]> dyT_2d = reshape(shape = r_dyT, x = dyT_raw)[name = string("dyT_2d")];
+
+        tensor<int32, [4]> r_xT = const()[name = string("r_xT"), val = tensor<int32, [4]>([1, 1, {in_dim}, {ps}])];
+        tensor<fp16, [1, 1, {in_dim}, {ps}]> xT_2d = reshape(shape = r_xT, x = xT_raw)[name = string("xT_2d")];
+
+        tensor<int32, [4]> r_BT = const()[name = string("r_BT"), val = tensor<int32, [4]>([1, 1, {out_dim}, {pr}])];
+        tensor<fp16, [1, 1, {out_dim}, {pr}]> BT_2d = reshape(shape = r_BT, x = BT_raw)[name = string("BT_2d")];
+
+        tensor<int32, [4]> r_A = const()[name = string("r_A"), val = tensor<int32, [4]>([1, 1, {in_dim}, {pr}])];
+        tensor<fp16, [1, 1, {in_dim}, {pr}]> A_2d = reshape(shape = r_A, x = A_raw)[name = string("A_2d")];
+
+        tensor<fp16, [1, 1, {pr}, {out_dim}]> B_2d = transpose(perm = pm, x = BT_2d)[name = string("B_2d")];
+        tensor<fp16, [1, 1, {pr}, {in_dim}]> AT_2d = transpose(perm = pm, x = A_2d)[name = string("AT_2d")];
+
+        bool bF = const()[name = string("bF"), val = bool(false)];
+
+        tensor<fp16, [1, 1, {pr}, {ps}]> tmp = matmul(transpose_x = bF, transpose_y = bF, x = B_2d, y = dyT_2d)[name = string("tmp")];
+        tensor<fp16, [1, 1, {pr}, {ps}]> axT = matmul(transpose_x = bF, transpose_y = bF, x = AT_2d, y = xT_2d)[name = string("axT")];
+
+        tensor<fp16, [1, 1, {ps}, {pr}]> tmpT = transpose(perm = pm, x = tmp)[name = string("tmpT")];
+        tensor<fp16, [1, 1, {ps}, {out_dim}]> dyTT = transpose(perm = pm, x = dyT_2d)[name = string("dyTT")];
+
+        tensor<fp16, [1, 1, {in_dim}, {pr}]> d_A_2d = matmul(transpose_x = bF, transpose_y = bF, x = xT_2d, y = tmpT)[name = string("d_A_2d")];
+        tensor<fp16, [1, 1, {pr}, {out_dim}]> d_B_2d = matmul(transpose_x = bF, transpose_y = bF, x = axT, y = dyTT)[name = string("d_B_2d")];
+
+        tensor<int32, [4]> r_dA = const()[name = string("r_dA"), val = tensor<int32, [4]>([1, {in_dim}, 1, {pr}])];
+        tensor<fp16, [1, {in_dim}, 1, {pr}]> d_A_h = reshape(shape = r_dA, x = d_A_2d)[name = string("d_A_h")];
+
+        tensor<int32, [4]> r_dB = const()[name = string("r_dB"), val = tensor<int32, [4]>([1, {pr}, 1, {out_dim}])];
+        tensor<fp16, [1, {pr}, 1, {out_dim}]> d_B_h = reshape(shape = r_dB, x = d_B_2d)[name = string("d_B_h")];
+
+        string to32 = const()[name = string("to32"), val = string("fp32")];
+        tensor<fp32, [1, {in_dim}, 1, {pr}]> d_A = cast(dtype = to32, x = d_A_h)[name = string("d_A")];
+        tensor<fp32, [1, {pr}, 1, {out_dim}]> d_B = cast(dtype = to32, x = d_B_h)[name = string("d_B")];
+    }} -> (d_A, d_B);
+}}
+"""
+
+
+# Global fused kernel cache
+_fused_kernel_cache: Dict[Tuple[int, int, int, int], ctypes.c_void_p] = {}
+
+
+def _fused_dynamic_lora_grad(
+    lib,
+    dy: np.ndarray,
+    x: np.ndarray,
+    lora_a: np.ndarray,
+    lora_b: np.ndarray,
+    kernel_cache: Optional[Dict] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute LoRA gradients (d_A, d_B) in a single ANE dispatch.
+
+    All 4 matmuls fused into one MIL program. Compile-once, update IOSurface each step.
+    Reduces per-module dispatches from 4 to 1.
+
+    Args:
+        lib: ctypes-loaded libane_bridge
+        dy: [seq, out_dim] upstream gradient
+        x: [seq, in_dim] layer input
+        lora_a: [in_dim, rank] LoRA A matrix
+        lora_b: [rank, out_dim] LoRA B matrix
+        kernel_cache: optional dict for kernel handles
+
+    Returns:
+        (d_lora_a[in_dim, rank], d_lora_b[rank, out_dim])
+    """
+    if kernel_cache is None:
+        kernel_cache = _fused_kernel_cache
+
+    seq, out_dim = dy.shape
+    in_dim = x.shape[1]
+    rank = lora_a.shape[1]
+
+    ps = _pad_spatial(seq)
+    pr = _pad_spatial(rank)
+    max_dim = max(in_dim, out_dim)
+    S_total = 2 * ps + 2 * pr
+
+    # Pad dy and x
+    if ps > seq:
+        dy_p = np.zeros((ps, out_dim), dtype=np.float32)
+        dy_p[:seq] = dy
+        x_p = np.zeros((ps, in_dim), dtype=np.float32)
+        x_p[:seq] = x
+    else:
+        dy_p = np.ascontiguousarray(dy, dtype=np.float32)
+        x_p = np.ascontiguousarray(x, dtype=np.float32)
+
+    cache_key = (in_dim, out_dim, rank, ps)
+
+    if cache_key not in kernel_cache:
+        mil_text = _gen_fused_lora_grad_mil(in_dim, out_dim, rank, ps)
+        mil_bytes = mil_text.encode('utf-8')
+
+        in_sz = (ctypes.c_size_t * 1)(1 * max_dim * 1 * S_total * 4)
+        out_sz = (ctypes.c_size_t * 2)(
+            1 * in_dim * 1 * pr * 4,
+            1 * pr * 1 * out_dim * 4
+        )
+
+        kernel = lib.ane_bridge_compile(
+            mil_bytes, len(mil_bytes),
+            None, 0,
+            1, in_sz, 2, out_sz
+        )
+        if not kernel:
+            raise RuntimeError(
+                f"ANE fused compile failed: in={in_dim} out={out_dim} rank={rank} ps={ps}"
+            )
+        kernel_cache[cache_key] = kernel
+
+    kernel = kernel_cache[cache_key]
+
+    # Pack all operands into single IOSurface
+    packed = np.zeros((1, max_dim, 1, S_total), dtype=np.float32)
+    packed[0, :out_dim, 0, 0:ps] = dy_p.T
+    packed[0, :in_dim, 0, ps:2 * ps] = x_p.T
+    # B^T: lora_b.T is [out_dim, rank], zero-pad rank→pr
+    packed[0, :out_dim, 0, 2 * ps:2 * ps + rank] = lora_b.T
+    # A: lora_a is [in_dim, rank], zero-pad rank→pr
+    packed[0, :in_dim, 0, 2 * ps + pr:2 * ps + pr + rank] = lora_a
+
+    packed_buf = np.ascontiguousarray(packed).tobytes()
+    lib.ane_bridge_write_input(
+        kernel, 0, ctypes.c_char_p(packed_buf), ctypes.c_size_t(len(packed_buf))
+    )
+
+    ok = lib.ane_bridge_eval(kernel)
+    if not ok:
+        if cache_key in kernel_cache:
+            del kernel_cache[cache_key]
+        raise RuntimeError(
+            f"ANE fused eval failed: in={in_dim} out={out_dim} rank={rank} ps={ps}"
+        )
+
+    d_A_4d = np.zeros((1, in_dim, 1, pr), dtype=np.float32)
+    d_B_4d = np.zeros((1, pr, 1, out_dim), dtype=np.float32)
+    lib.ane_bridge_read_output(kernel, 0, d_A_4d.ctypes.data, ctypes.c_size_t(d_A_4d.nbytes))
+    lib.ane_bridge_read_output(kernel, 1, d_B_4d.ctypes.data, ctypes.c_size_t(d_B_4d.nbytes))
+
+    d_lora_a = d_A_4d.reshape(in_dim, pr)[:, :rank]
+    d_lora_b = d_B_4d.reshape(pr, out_dim)[:rank, :]
+
+    return d_lora_a, d_lora_b
+
+
 def _gen_dynamic_matmul_mil(in_ch: int, out_ch: int, spatial: int) -> str:
     """Generate MIL for dynamic matmul using packed-IOSurface pattern.
 
@@ -768,11 +964,10 @@ def _persistent_ane_worker(
                 # Try fused kernel first (if enabled)
                 if use_fusion:
                     try:
-                        d_lora_a_final, d_lora_b_final = _fused_conv_lora_grad(
-                            lib, dy, x, lora_a, lora_b, kernel_cache
+                        d_lora_a_final, d_lora_b_final = _fused_dynamic_lora_grad(
+                            lib, dy[:seq], x[:seq], lora_a, lora_b, kernel_cache
                         )
-                        compiles += 1  # Only compiles if not cached
-                        dispatches += 1  # Single dispatch for all ops
+                        dispatches += 1
                     except RuntimeError as e:
                         # Fallback to unfused if fused fails
                         result_queue.put({
