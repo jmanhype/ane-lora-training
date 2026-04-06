@@ -25,6 +25,8 @@ LoRA gradient computation — all 4 matrix multiplications per adapter module �
   Learning:    YES ✓
 ```
 
+![Loss Curve](loss_curve.png)
+
 ## What Makes This Different
 
 | Feature | This Repo | maderix/ANE | Espresso | CoreML |
