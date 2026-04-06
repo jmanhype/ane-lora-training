@@ -4,9 +4,13 @@ ANE LoRA Gradient Kernels — Conv-based MIL dispatch via libane_bridge.
 Computes LoRA gradients on the Apple Neural Engine using 1x1 convolutions
 (the only MIL compute op the ANE private compiler supports at runtime).
 
-Key insight: matmul MIL op compiles but ALWAYS fails at eval.
-Only conv works. We express all matrix multiplications as:
-    A[M,K] @ B[K,N]  →  conv(input=[1,K,1,N], weight=[M,K,1,1]) → [1,M,1,N]
+Key insight: ANE matmul op works when BOTH operands come from a single
+packed IOSurface (maderix pattern). Activations and weights are packed along
+the spatial dimension, then slice_by_size + reshape + matmul in MIL.
+This enables compile-once, update-IOSurface-each-step — zero recompile.
+
+Legacy conv path (still available): uses BLOBFILE static weights, recompiles
+each call. Used only for verify_conv() sanity check.
 
 ANE spatial constraints (discovered empirically):
     - Spatial (last dim) must be >= 16 AND a multiple of 16
@@ -14,16 +18,10 @@ ANE spatial constraints (discovered empirically):
     - Auto-handled by _pad_spatial() in _conv_matmul()
 
 Compile budget management:
-    ANE leaks ~1 handle per ane_bridge_compile(). After ~119, new compiles
-    silently fail. We run gradient computation in a subprocess to get a
-    fresh bridge per training step. 64 compiles per step (16 modules × 4)
-    fits within budget with room to spare.
-
-Fused Kernel Optimization (Espresso-style):
-    The persistent bridge uses a fused MIL program that computes both
-    LoRA gradients (d_A and d_B) in a single ANE dispatch, reducing
-    per-module dispatches from 4 to 1. Kernels are cached by dimension
-    tuple (in_dim, out_dim, rank, padded_seq) for reuse across steps.
+    ANE leaks ~1 handle per ane_bridge_compile(). The dynamic matmul
+    pattern compiles once per unique (out_ch, in_ch, spatial) shape,
+    then reuses the kernel handle forever — typically ~4-8 compiles total
+    for all LoRA dimensions. No subprocess isolation needed.
 
 MIL format: program(1.3), func main<ios18>, fp32 I/O, internal fp16 casting.
 Matches proven patterns from maderix/ANE training/ane_mil_gen.h (conv variant).
@@ -144,33 +142,60 @@ def _build_weight_blob(weights_f32: np.ndarray) -> bytes:
 #  MIL generation                                                               #
 # --------------------------------------------------------------------------- #
 
-def _gen_fused_lora_grad_mil(
-    in_dim: int, out_dim: int, rank: int, spatial: int
-) -> str:
-    """Generate fused MIL for LoRA gradient using packed-IOSurface + matmul.
+def _gen_dynamic_matmul_mil(in_ch: int, out_ch: int, spatial: int) -> str:
+    """Generate MIL for dynamic matmul using packed-IOSurface pattern.
 
-    Uses maderix's dynamic matmul pattern: single input with data packed along
-    spatial dimension, slice_by_size to extract, reshape+transpose for matmul.
+    Computes y = x @ W where BOTH x and W are packed into a single input
+    IOSurface along the spatial dimension. No BLOBFILE weights needed.
+    Compile once, update IOSurface data each call — zero recompile.
 
-    Computes steps 1+3 (independent) in one dispatch:
-        1. tmp = B^T @ dy  → matmul([rank,out_dim] @ [out_dim,spatial])
-        3. ax  = A^T @ x   → matmul([rank,in_dim] @ [in_dim,spatial])
+    Input layout: [1, in_ch, 1, spatial + out_ch]
+        sp[0:spatial]           = x[in_ch, spatial]  (activations)
+        sp[spatial:spatial+out_ch] = W[in_ch, out_ch] (weight columns)
 
-    Input layout [1, C, 1, spatial + out_dim + in_dim] where C = max(in_dim, out_dim):
-        [0:spatial]                  → dy[out_dim, spatial] (top out_dim channels)
-        [spatial:spatial+out_dim]    → B^T[rank, out_dim] packed in top rank channels
-        [spatial+out_dim:end]        → A^T[rank, in_dim] packed in top rank channels
-        x[in_dim, spatial] overlaid on [0:spatial] starting at channel offset out_dim
-        (only works when in_dim + out_dim <= C... too complex)
+    Output: [1, out_ch, 1, spatial]
 
-    TODO: This approach requires careful channel-dimension packing when
-    in_dim != out_dim. For now, use the proven 4-dispatch unfused path.
-    Fusion will be implemented once the basic training loop is validated.
+    MIL flow:
+        1. cast to fp16
+        2. slice_by_size to extract x[in_ch, spatial] and W[in_ch, out_ch]
+        3. reshape both to [1, 1, in_ch, N] for batch matmul
+        4. transpose x to [1, 1, spatial, in_ch]
+        5. matmul: [1,1,spatial,in_ch] @ [1,1,in_ch,out_ch] = [1,1,spatial,out_ch]
+        6. transpose result to [1,1,out_ch,spatial]
+        7. reshape to [1, out_ch, 1, spatial]
+        8. cast back to fp32
+
+    Based on maderix/ANE-backup/training/test_dynamic_matmul.m
     """
-    raise NotImplementedError(
-        "Fused kernel not yet ported to packed-IOSurface matmul pattern. "
-        "Use unfused 4-dispatch path (set ANE_DISABLE_FUSION=1 or don't call this)."
-    )
+    sp_total = spatial + out_ch
+    return f"""program(1.3)
+{BUILD_INFO}
+{{
+    func main<{MIL_TARGET}>(tensor<fp32, [1, {in_ch}, 1, {sp_total}]> x) {{
+        string to16 = const()[name = string("to16"), val = string("fp16")];
+        tensor<fp16, [1, {in_ch}, 1, {sp_total}]> xh = cast(dtype = to16, x = x)[name = string("cin")];
+        tensor<int32, [4]> ba = const()[name = string("ba"), val = tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [4]> sa = const()[name = string("sa"), val = tensor<int32, [4]>([1,{in_ch},1,{spatial}])];
+        tensor<fp16, [1,{in_ch},1,{spatial}]> act = slice_by_size(x=xh,begin=ba,size=sa)[name=string("act")];
+        tensor<int32, [4]> bw = const()[name = string("bw"), val = tensor<int32, [4]>([0,0,0,{spatial}])];
+        tensor<int32, [4]> sw = const()[name = string("sw"), val = tensor<int32, [4]>([1,{in_ch},1,{out_ch}])];
+        tensor<fp16, [1,{in_ch},1,{out_ch}]> wt = slice_by_size(x=xh,begin=bw,size=sw)[name=string("wt")];
+        tensor<int32, [4]> ra = const()[name = string("ra"), val = tensor<int32, [4]>([1,1,{in_ch},{spatial}])];
+        tensor<fp16, [1,1,{in_ch},{spatial}]> a2 = reshape(shape=ra,x=act)[name=string("a2")];
+        tensor<int32, [4]> pm = const()[name = string("pm"), val = tensor<int32, [4]>([0,1,3,2])];
+        tensor<fp16, [1,1,{spatial},{in_ch}]> a3 = transpose(perm=pm,x=a2)[name=string("a3")];
+        tensor<int32, [4]> rw = const()[name = string("rw"), val = tensor<int32, [4]>([1,1,{in_ch},{out_ch}])];
+        tensor<fp16, [1,1,{in_ch},{out_ch}]> W = reshape(shape=rw,x=wt)[name=string("W")];
+        bool bF = const()[name = string("bF"), val = bool(false)];
+        tensor<fp16, [1,1,{spatial},{out_ch}]> yh = matmul(transpose_x=bF,transpose_y=bF,x=a3,y=W)[name=string("mm")];
+        tensor<fp16, [1,1,{out_ch},{spatial}]> yt = transpose(perm=pm,x=yh)[name=string("yt")];
+        tensor<int32, [4]> ro = const()[name = string("ro"), val = tensor<int32, [4]>([1,{out_ch},1,{spatial}])];
+        tensor<fp16, [1,{out_ch},1,{spatial}]> yr = reshape(shape=ro,x=yt)[name=string("yr")];
+        string to32 = const()[name = string("to32"), val = string("fp32")];
+        tensor<fp32, [1,{out_ch},1,{spatial}]> y = cast(dtype = to32, x = yr)[name = string("cout")];
+    }} -> (y);
+}}
+"""
 
 
 def _gen_conv_mil(in_ch: int, out_ch: int, spatial: int) -> str:
@@ -289,6 +314,109 @@ def _conv_matmul(lib, W: np.ndarray, x: np.ndarray) -> np.ndarray:
     result = out_4d.reshape(out_ch, spatial)
     if spatial > orig_spatial:
         result = result[:, :orig_spatial]
+    return result
+
+
+# Global kernel cache for dynamic matmul (compile-once pattern)
+_dynamic_kernel_cache: Dict[Tuple[int, int, int], ctypes.c_void_p] = {}
+
+
+def _dynamic_matmul(
+    lib, W: np.ndarray, x: np.ndarray,
+    kernel_cache: Optional[Dict] = None
+) -> np.ndarray:
+    """Compute y = W @ x using packed-IOSurface dynamic matmul on ANE.
+
+    Compile-once pattern: the MIL program is compiled on first call for each
+    (out_ch, in_ch, spatial) shape tuple. Subsequent calls with the same shape
+    only update the IOSurface data — zero recompile, zero handle leak.
+
+    Input IOSurface layout: [1, in_ch, 1, spatial + out_ch]
+        sp[0:spatial]              = x[in_ch, spatial]
+        sp[spatial:spatial+out_ch] = W[in_ch, out_ch] (columns)
+
+    Args:
+        lib: ctypes-loaded libane_bridge
+        W: [out_ch, in_ch] weight matrix
+        x: [in_ch, spatial] input
+        kernel_cache: optional dict for kernel handles (defaults to global)
+
+    Returns:
+        [out_ch, spatial] result
+    """
+    if kernel_cache is None:
+        kernel_cache = _dynamic_kernel_cache
+
+    orig_out_ch, in_ch = W.shape
+    orig_spatial = x.shape[1] if x.ndim == 2 else x.shape[0]
+    if x.ndim == 1:
+        orig_spatial = 1
+        x = x.reshape(in_ch, 1)
+
+    spatial = _pad_spatial(orig_spatial)
+    # Pad out_ch too — ANE matmul output dim must meet alignment
+    out_ch = _pad_spatial(orig_out_ch)
+
+    sp_total = spatial + out_ch
+
+    # Pad x if needed
+    if spatial > orig_spatial:
+        x_padded = np.zeros((in_ch, spatial), dtype=np.float32)
+        x_padded[:, :orig_spatial] = x
+        x = x_padded
+
+    # Pad W if out_ch was rounded up
+    if out_ch > orig_out_ch:
+        W_padded = np.zeros((out_ch, in_ch), dtype=np.float32)
+        W_padded[:orig_out_ch] = W
+        W = W_padded
+
+    cache_key = (out_ch, in_ch, spatial)
+
+    if cache_key not in kernel_cache:
+        mil_text = _gen_dynamic_matmul_mil(in_ch, out_ch, spatial)
+        mil_bytes = mil_text.encode('utf-8')
+
+        in_sz = (ctypes.c_size_t * 1)(1 * in_ch * 1 * sp_total * 4)
+        out_sz = (ctypes.c_size_t * 1)(1 * out_ch * 1 * spatial * 4)
+
+        kernel = lib.ane_bridge_compile(
+            mil_bytes, len(mil_bytes),
+            None, 0,
+            1, in_sz, 1, out_sz
+        )
+        if not kernel:
+            raise RuntimeError(
+                f"ANE dynamic matmul compile failed: W[{out_ch},{in_ch}] spatial={spatial}"
+            )
+        kernel_cache[cache_key] = kernel
+
+    kernel = kernel_cache[cache_key]
+
+    # Pack activations and weights into single IOSurface
+    packed = np.zeros((1, in_ch, 1, sp_total), dtype=np.float32)
+    packed[0, :, 0, :spatial] = x
+    packed[0, :, 0, spatial:] = W.T  # W.T[in_ch, out_ch]
+
+    packed_buf = np.ascontiguousarray(packed).tobytes()
+    lib.ane_bridge_write_input(
+        kernel, 0, ctypes.c_char_p(packed_buf), ctypes.c_size_t(len(packed_buf))
+    )
+
+    ok = lib.ane_bridge_eval(kernel)
+    if not ok:
+        if cache_key in kernel_cache:
+            del kernel_cache[cache_key]
+        raise RuntimeError(
+            f"ANE dynamic matmul eval failed: W[{out_ch},{in_ch}] spatial={spatial}"
+        )
+
+    out_4d = np.zeros((1, out_ch, 1, spatial), dtype=np.float32)
+    lib.ane_bridge_read_output(kernel, 0, out_4d.ctypes.data, ctypes.c_size_t(out_4d.nbytes))
+
+    result = out_4d.reshape(out_ch, spatial)
+    # Truncate padded dimensions
+    result = result[:orig_out_ch, :orig_spatial]
     return result
 
 
@@ -507,20 +635,20 @@ def _ane_gradient_worker(bridge_path: str, data_dir: str, result_dir: str):
 
         try:
             # Step 1: tmp = dy @ B^T  →  (B @ dy^T)^T
-            tmp = _conv_matmul(lib, lora_b, dy.T).T
-            compiles += 1; dispatches += 1
+            tmp = _dynamic_matmul(lib, lora_b, dy.T).T
+            dispatches += 1
 
             # Step 2: d_A = x^T @ tmp  (spatial=rank auto-padded to 16)
-            d_lora_a = _conv_matmul(lib, x.T, tmp)
-            compiles += 1; dispatches += 1
+            d_lora_a = _dynamic_matmul(lib, x.T, tmp)
+            dispatches += 1
 
             # Step 3: ax = x @ A  →  (A^T @ x^T)^T
-            ax = _conv_matmul(lib, lora_a.T, x.T).T
-            compiles += 1; dispatches += 1
+            ax = _dynamic_matmul(lib, lora_a.T, x.T).T
+            dispatches += 1
 
             # Step 4: d_B = ax^T @ dy
-            d_lora_b = _conv_matmul(lib, ax.T, dy)
-            compiles += 1; dispatches += 1
+            d_lora_b = _dynamic_matmul(lib, ax.T, dy)
+            dispatches += 1
 
             # Trim to original dimensions
             d_lora_a_final = d_lora_a[:in_dim, :rank]
@@ -653,22 +781,22 @@ def _persistent_ane_worker(
                         })
                         continue
                 else:
-                    # Unfused path: 4 separate conv dispatches
+                    # Unfused path: 4 dynamic matmul dispatches (compile-once)
                     # Step 1: tmp = dy @ B^T  →  (B @ dy^T)^T
-                    tmp = _conv_matmul(lib, lora_b, dy.T).T
-                    compiles += 1; dispatches += 1
+                    tmp = _dynamic_matmul(lib, lora_b, dy.T, kernel_cache).T
+                    dispatches += 1
 
                     # Step 2: d_A = x^T @ tmp
-                    d_lora_a = _conv_matmul(lib, x.T, tmp)
-                    compiles += 1; dispatches += 1
+                    d_lora_a = _dynamic_matmul(lib, x.T, tmp, kernel_cache)
+                    dispatches += 1
 
                     # Step 3: ax = x @ A  →  (A^T @ x^T)^T
-                    ax = _conv_matmul(lib, lora_a.T, x.T).T
-                    compiles += 1; dispatches += 1
+                    ax = _dynamic_matmul(lib, lora_a.T, x.T, kernel_cache).T
+                    dispatches += 1
 
                     # Step 4: d_B = ax^T @ dy
-                    d_lora_b = _conv_matmul(lib, ax.T, dy)
-                    compiles += 1; dispatches += 1
+                    d_lora_b = _dynamic_matmul(lib, ax.T, dy, kernel_cache)
+                    dispatches += 1
 
                     # Trim to original dimensions
                     d_lora_a_final = d_lora_a[:in_dim, :rank]
