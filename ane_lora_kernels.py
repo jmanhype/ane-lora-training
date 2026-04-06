@@ -64,6 +64,9 @@ BUILD_INFO = (
     '{"coremltools-version", "9.0"}})]'
 )
 
+# MIL program version target
+MIL_TARGET = "ios18"
+
 # ANE spatial dimension constraints (discovered empirically on M4):
 #   - Must be >= 16
 #   - Must be a multiple of 16
@@ -236,12 +239,12 @@ def _gen_conv_mil(in_ch: int, out_ch: int, spatial: int) -> str:
       - No % prefix on variable names
       - Typed variable declarations
       - Const declarations: type varname = const()[name = ..., val = ...]
-      - Input tensors for dynamic weights (no BLOBFILE - weights passed at runtime)
+      - BLOBFILE for weight data with offset past header
     """
     return f"""program(1.3)
 {BUILD_INFO}
 {{
-    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {spatial}]> x, tensor<fp16, [{out_ch}, {in_ch}, 1, 1]> W) {{
+    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {spatial}]> x) {{
         string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
         tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
         tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
@@ -249,6 +252,7 @@ def _gen_conv_mil(in_ch: int, out_ch: int, spatial: int) -> str:
         int32 c_groups = const()[name = string("c_groups"), val = int32(1)];
         string to_fp16 = const()[name = string("to_fp16"), val = string("fp16")];
         tensor<fp16, [1, {in_ch}, 1, {spatial}]> x16 = cast(dtype = to_fp16, x = x)[name = string("cast_in")];
+        tensor<fp16, [{out_ch}, {in_ch}, 1, 1]> W = const()[name = string("W"), val = tensor<fp16, [{out_ch}, {in_ch}, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
         tensor<fp16, [1, {out_ch}, 1, {spatial}]> y16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W, x = x16)[name = string("conv")];
         string to_fp32 = const()[name = string("to_fp32"), val = string("fp32")];
         tensor<fp32, [1, {out_ch}, 1, {spatial}]> y = cast(dtype = to_fp32, x = y16)[name = string("cast_out")];
@@ -302,14 +306,13 @@ def _conv_matmul(lib, W: np.ndarray, x: np.ndarray) -> np.ndarray:
     mil_bytes = mil_text.encode('utf-8')
 
     wb = (ctypes.c_uint8 * len(weight_blob))(*weight_blob)
-    in_sz = (ctypes.c_size_t * 2)(1 * in_ch * 1 * spatial * 4,  # fp32 x input
-                                  out_ch * in_ch * 1 * 1 * 2)    # fp16 W input
+    in_sz = (ctypes.c_size_t * 1)(1 * in_ch * 1 * spatial * 4)  # fp32
     out_sz = (ctypes.c_size_t * 1)(1 * out_ch * 1 * spatial * 4)
 
     kernel = lib.ane_bridge_compile(
         mil_bytes, len(mil_bytes),
         wb, len(weight_blob),
-        2, in_sz, 1, out_sz
+        1, in_sz, 1, out_sz
     )
     if not kernel:
         raise RuntimeError(f"ANE conv compile failed: W[{out_ch},{in_ch}] x[{in_ch},{spatial}]")
@@ -318,11 +321,6 @@ def _conv_matmul(lib, W: np.ndarray, x: np.ndarray) -> np.ndarray:
     x_4d = np.ascontiguousarray(x.reshape(1, in_ch, 1, spatial), dtype=np.float32)
     x_buf = x_4d.tobytes()
     lib.ane_bridge_write_input(kernel, 0, ctypes.c_char_p(x_buf), ctypes.c_size_t(len(x_buf)))
-
-    # Write fp16 weight input
-    W_fp16 = W_4d.astype(np.float16)
-    W_buf = W_fp16.tobytes()
-    lib.ane_bridge_write_input(kernel, 1, ctypes.c_char_p(W_buf), ctypes.c_size_t(len(W_buf)))
 
     # Dispatch to Neural Engine
     ok = lib.ane_bridge_eval(kernel)

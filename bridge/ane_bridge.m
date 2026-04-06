@@ -224,47 +224,10 @@ bool ane_bridge_eval(ANEKernelHandle *kernel) {
     @autoreleasepool {
         if (!kernel || !kernel->model) return false;
         NSError *e = nil;
-
-        // Try via _ANEClient (required on macOS 15+)
-        // _ANEClient.sharedConnection → evaluateWithModel:options:request:qos:error:
-        Class clientClass = NSClassFromString(@"_ANEClient");
-        id client = clientClass ? ((id(*)(Class,SEL))objc_msgSend)(
-            clientClass, @selector(sharedConnection)) : nil;
-
-        BOOL ok = NO;
-
-        // Map IOSurfaces on model (may be required on macOS 15+)
-        ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
-            kernel->model, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
-            kernel->request, NO, &e);
-        e = nil;
-
-        // Direct model eval (only path that works with _ANEInMemoryModel)
-        ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+        BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
             kernel->model, @selector(evaluateWithQoS:options:request:error:),
             21, @{}, kernel->request, &e);
-        if (!ok) {
-            fprintf(stderr, "ane_bridge: eval failed: %s\n",
-                    e ? [[e description] UTF8String] : "unknown");
-
-            // Unmap and remap, then retry
-            ((void(*)(id,SEL,id))objc_msgSend)(
-                kernel->model, @selector(unmapIOSurfacesWithRequest:), kernel->request);
-            e = nil;
-            ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
-                kernel->model, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
-                kernel->request, YES, &e);
-            e = nil;
-
-            ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
-                kernel->model, @selector(evaluateWithQoS:options:request:error:),
-                21, @{}, kernel->request, &e);
-            if (!ok) {
-                fprintf(stderr, "ane_bridge: eval retry failed: %s\n",
-                        e ? [[e description] UTF8String] : "unknown");
-            }
-        }
-
+        if (!ok) fprintf(stderr, "ane_bridge: eval failed: %s\n", e ? [[e description] UTF8String] : "unknown");
         return ok;
     }
 }
