@@ -165,8 +165,7 @@ if ane.available:
 
         set_ane_kernels(ane_kernels)
         replaced = replace_lora_with_ane(model)
-        print(f"[ANE] {replaced} LoRA layers -> ANE gradient dispatch active "
-              f"(conv-based, subprocess isolation)")
+        print(f"[ANE] {replaced} LoRA layers -> ANE fused gradient dispatch active")
     except Exception as e:
         print(f"[ANE] Layer replacement failed ({e}), using MLX GPU fallback")
         ane_kernels = None
@@ -296,7 +295,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
             "lora_rank": LORA_RANK,
             "lora_layers": LORA_LAYERS,
             "ane_available": ane.available,
-            "ane_phase": "2b-conv" if ane_kernels is not None else ("fallback" if not ane.available else "init"),
+            "ane_phase": "fused-kernel" if ane_kernels is not None else ("fallback" if not ane.available else "init"),
             "ane_stats": ane_stats,
             "training_pairs_total": len(training_pairs),
             "training_queue_size": training_queue.qsize(),
@@ -396,7 +395,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    ane_mode = "Phase 2b -- CONV GRADIENT DISPATCH" if ane_kernels else (
+    ane_mode = "FUSED KERNEL (1 dispatch/module)" if ane_kernels else (
         "FALLBACK (MLX GPU)" if not ane.available else "INIT FAILED")
     print(f"\n{'='*60}")
     print(f"  ANE Real-Time Fine-Tuning Daemon")
@@ -404,7 +403,7 @@ if __name__ == "__main__":
     print(f"  LoRA:      rank={LORA_RANK}, layers={LORA_LAYERS}")
     print(f"  ANE:       {ane_mode}")
     if ane_kernels:
-        print(f"  Method:    conv kernels, subprocess isolation")
+        print(f"  Method:    fused packed-IOSurface, compile-once")
     print(f"  Port:      {PORT}")
     print(f"  Adapter:   {ADAPTER_DIR}")
     print(f"{'='*60}\n")
