@@ -234,10 +234,10 @@ bool ane_bridge_eval(ANEKernelHandle *kernel) {
         BOOL ok = NO;
 
         if (client) {
-            // macOS 15+: Map IOSurfaces via client
-            ((BOOL(*)(id,SEL,id,id,BOOL,NSError**))objc_msgSend)(
-                client, @selector(mapIOSurfacesWithModel:request:cacheInference:error:),
-                kernel->model, kernel->request, NO, &e);
+            // macOS 15+: Map IOSurfaces directly on model first
+            ((BOOL(*)(id,SEL,id,BOOL,NSError**))objc_msgSend)(
+                kernel->model, @selector(mapIOSurfacesWithRequest:cacheInference:error:),
+                kernel->request, NO, &e);
             e = nil;
 
             // Evaluate via client (5-arg: model, options, request, qos, error)
